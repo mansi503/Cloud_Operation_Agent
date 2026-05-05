@@ -1,0 +1,40 @@
+# HELP gcp_active_incidents_total Number of currently active GCP incidents
+# TYPE gcp_active_incidents_total gauge
+gcp_active_incidents_total 2
+# HELP gcp_incident_active Is this incident currently active (1=active, 0=resolved)
+# TYPE gcp_incident_active gauge
+gcp_incident_active{id="inc-001",service="Google Compute Engine",severity="high",region="us-central1",status="active"} 1
+gcp_incident_active{id="inc-002",service="Cloud Storage",severity="medium",region="europe-west1",status="resolved"} 0
+gcp_incident_active{id="inc-003",service="BigQuery",severity="low",region="us-east1",status="resolved"} 0
+gcp_incident_active{id="inc-004",service="Cloud Run",severity="high",region="asia-east1",status="active"} 1
+gcp_incident_active{id="inc-005",service="Cloud SQL",severity="medium",region="us-central1",status="monitoring"} 0
+# HELP gcp_incident_duration_minutes Duration of incident in minutes
+# TYPE gcp_incident_duration_minutes gauge
+gcp_incident_duration_minutes{id="inc-001",service="Google Compute Engine",severity="high"} 45
+gcp_incident_duration_minutes{id="inc-002",service="Cloud Storage",severity="medium"} 120
+gcp_incident_duration_minutes{id="inc-003",service="BigQuery",severity="low"} 15
+gcp_incident_duration_minutes{id="inc-004",service="Cloud Run",severity="high"} 30
+gcp_incident_duration_minutes{id="inc-005",service="Cloud SQL",severity="medium"} 60
+# HELP gcp_incidents_by_severity Count of incidents per severity
+# TYPE gcp_incidents_by_severity gauge
+gcp_incidents_by_severity{severity="high"} 2
+gcp_incidents_by_severity{severity="medium"} 2
+gcp_incidents_by_severity{severity="low"} 1
+# HELP gcp_service_uptime_percent Uptime percentage per GCP service
+# TYPE gcp_service_uptime_percent gauge
+gcp_service_uptime_percent{service="compute_engine",region="us-central1"} 99.9118
+gcp_service_uptime_percent{service="cloud_storage",region="us-central1"} 99.9635
+gcp_service_uptime_percent{service="bigquery",region="us-east1"} 99.9441
+gcp_service_uptime_percent{service="cloud_run",region="asia-east1"} 98.4714
+gcp_service_uptime_percent{service="cloud_sql",region="us-central1"} 99.2383
+gcp_service_uptime_percent{service="kubernetes_engine",region="europe-west1"} 100.0
+gcp_service_uptime_percent{service="cloud_functions",region="us-central1"} 99.8183
+# HELP gcp_service_health_score Overall health score 0-100
+# TYPE gcp_service_health_score gauge
+gcp_service_health_score{service="compute_engine",region="us-central1"} 98.9
+gcp_service_health_score{service="cloud_storage",region="us-central1"} 99.0
+gcp_service_health_score{service="bigquery",region="us-east1"} 99.8
+gcp_service_health_score{service="cloud_run",region="asia-east1"} 96.6
+gcp_service_health_score{service="cloud_sql",region="us-central1"} 99.0
+gcp_service_health_score{service="kubernetes_engine",region="europe-west1"} 98.8
+gcp_service_health_score{service="cloud_functions",region="us-central1"} 99.0

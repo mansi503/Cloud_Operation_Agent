@@ -17,7 +17,8 @@ from tools.gsheets_tool import (
     detect_cost_anomalies,
 )
 
-load_dotenv()
+from pathlib import Path
+load_dotenv(dotenv_path=Path(__file__).parent.parent.parent / ".env")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL   = "llama-3.3-70b-versatile"
@@ -39,6 +40,8 @@ async def setup():
 
 def classify_route(text: str) -> str:
     q = text.lower()
+
+    # FinOps — cost/billing questions
     if any(k in q for k in [
         "cost", "billing", "spend", "budget", "invoice", "finance",
         "how much", "price", "expensive", "cheap", "forecast",
@@ -46,19 +49,37 @@ def classify_route(text: str) -> str:
         "last month", "this month", "last year", "this year",
     ]):
         return "finops"
+
+    # Uptime — HTTP monitor / UptimeRobot questions
     if any(k in q for k in [
-        "uptime", "sla", "downtime", "outage", "incident",
-        "status", "availability", "response time", "latency",
-        "reliability", "monitor", "gcp status", "is gcp up",
-        "is gcp down", "cloud status", "up or down",
+        "uptime", "sla", "downtime", "outage",
+        "response time", "latency", "reliability",
+        "monitor", "gcp status", "is gcp up", "is gcp down",
+        "cloud status", "up or down", "status.cloud.google.com",
     ]):
         return "uptime"
+
+    # Health — GCP service health via Prometheus/Grafana
+    # Broad set of keywords covering GCP services, health, incidents
     if any(k in q for k in [
-        "pod", "pods", "kubernetes", "k8s", "deployment", "deployments",
-        "container", "cpu", "memory", "logs", "grafana", "prometheus",
-        "loki", "crashloop", "resources", "namespace", "node",
+        # GCP service names
+        "compute engine", "cloud storage", "bigquery", "cloud run",
+        "cloud sql", "cloud functions", "kubernetes engine", "gke",
+        # Health/metric concepts
+        "health", "health score", "service health", "service status",
+        "services", "gcp services", "what services",
+        "incident", "incidents", "active incident",
+        "severity", "high severity", "medium severity", "low severity",
+        "degraded", "affected",
+        # Prometheus/Grafana concepts
+        "prometheus", "grafana", "metrics", "datasource",
+        "uptime percent", "uptime percentage",
+        # Generic infra terms kept for completeness
+        "pod", "pods", "kubernetes", "k8s", "deployment",
+        "container", "cpu", "memory", "logs", "namespace", "node",
     ]):
         return "health"
+
     return "default"
 
 
@@ -69,20 +90,30 @@ def _build_finops_agent(model):
 
 DATA SOURCE: Google Sheets billing dataset (GCP, AWS, Azure costs Jan 2023 to Apr 2026).
 
-TOOL MAPPING:
-- Schema / what data exists           → fetch_billing_schema
-- General cost query with filters     → query_billing_data
-- Current month spend                 → get_current_month_cost
-- Monthly trend over time             → get_cost_trend
-- Highest / lowest cost + reasons     → get_max_min_cost_period
-- Predict future costs                → get_cost_forecast
-- Detect billing spikes / anomalies   → detect_cost_anomalies
+TOOL SELECTION — follow this strictly:
+1. "this month" / "current month" / "how much this month"  → get_current_month_cost (no parameters)
+2. "trend" / "over time" / "monthly comparison"            → get_cost_trend
+3. "highest" / "lowest" / "most expensive month"           → get_max_min_cost_period
+4. "forecast" / "predict" / "future cost"                  → get_cost_forecast
+5. "anomaly" / "spike" / "unusual" / "unexpected"          → detect_cost_anomalies
+6. "what data" / "schema" / "what services exist"          → fetch_billing_schema
+7. Specific year / provider / service / breakdown          → query_billing_data
+
+RESPONSE FORMAT — always structure answers like this:
+**Summary**
+One sentence answer with the key number.
+
+**Breakdown**
+- Item 1: value
+- Item 2: value
+
+**Insight**
+One sentence of useful context or trend observation.
 
 RULES:
-- Call fetch_billing_schema first if unsure what data exists.
+- Never call query_billing_data for current month — use get_current_month_cost
 - Only report data from tools. Never fabricate numbers.
-- Format costs with $ and commas (e.g. $12,345.67).
-- Explain anomalies in plain business language.
+- Always use USD with commas e.g. 12,345.67 (do NOT use dollar signs)
 - Never show raw JSON or stack traces."""
 
     return create_react_agent(model, [
@@ -103,14 +134,24 @@ def _build_uptime_agent(model):
 MONITOR: GCP Status Feed | ID: {os.getenv("MONITOR_ID")} | URL: https://status.cloud.google.com/incidents.json
 
 TOOL MAPPING:
-- SLA / uptime % / availability       → get_mysoftware_sla
-- Current status (UP/DOWN/PAUSED)     → get_monitor_status
-- Incidents / outages / downtime      → get_monitor_incidents (set days as needed)
-- Response time / latency             → get_monitor_response_times (set hours as needed)
+- SLA / uptime % / availability  → get_mysoftware_sla
+- Current status (UP/DOWN)       → get_monitor_status
+- Incidents / outages            → get_monitor_incidents (set days as needed)
+- Response time / latency        → get_monitor_response_times (set hours as needed)
+
+RESPONSE FORMAT:
+**Status**
+Current state in one line.
+
+**Details**
+Key metrics and numbers.
+
+**Recent Activity**
+Incidents or response time highlights if relevant.
 
 RULES:
 - Only report data from tools. Never fabricate.
-- Explain incidents as GCP service disruptions in plain language.
+- Describe incidents in plain English as GCP service disruptions.
 - Never show raw JSON or stack traces."""
 
     return create_react_agent(model, [
@@ -126,28 +167,56 @@ def _build_health_agent(model):
     )
     from datetime import datetime
     today = datetime.now().strftime("%B %d, %Y")
-    system_prompt = f"""Today is {today}. You are the Infrastructure Health Agent for the CloudOps platform.
+    system_prompt = f"""Today is {today}. You are the GCP Infrastructure Health Agent.
 
-DATA SOURCES: Prometheus (metrics via Grafana), Loki (logs via Grafana).
-NAMESPACE: {os.getenv("NAMESPACE", "default")}
+DATA SOURCE: Prometheus metrics via Grafana API (local setup).
+
+IMPORTANT: If a tool returns an "error" key, report it clearly to the user as:
+"I was unable to fetch [data type]. Error: [error message]"
+Never fall back to generic knowledge when a tool returns an error.
+
+AVAILABLE METRICS:
+- gcp_service_uptime_percent    — uptime % per service
+- gcp_service_health_score      — health score 0-100
+- gcp_incident_active           — active incidents with severity/region/status
+- gcp_incident_duration_minutes — duration in minutes
+
+SERVICES: compute_engine, cloud_storage, bigquery, cloud_run, cloud_sql,
+          kubernetes_engine, cloud_functions
 
 TOOL MAPPING:
-- List all deployments                → get_all_deployments_json
-- Pod CPU/memory/network/storage      → get_all_pod_resources_json
-- Pod or container logs               → get_pod_logs_json
-- List connected datasources          → list_datasources
+- List GCP services              → get_all_deployments_json
+- Uptime % and health scores     → get_all_pod_resources_json
+- Active incidents               → get_pod_logs_json
+- List Grafana datasources       → list_datasources
+
+RESPONSE FORMAT:
+**Service Health Overview**
+| Service | Uptime | Health Score | Status |
+|---------|--------|--------------|--------|
+| ...     | ...    | ...          | ...    |
+
+**Active Incidents**
+List any active incidents with severity and duration.
+
+**Summary**
+One line overall assessment.
+
+HEALTH CLASSIFICATION:
+- Healthy  = uptime >= 99.0%
+- Degraded = uptime 95.0% to 98.99%
+- Critical = uptime < 95.0%
 
 RULES:
-- Only report data from tools. Never fabricate metrics.
-- Summarize pod health as Healthy / Warning / Critical.
-- Convert bytes to MB/GB, raw cores to millicores where helpful.
+- Call get_all_pod_resources_json for health/uptime questions
+- Call get_pod_logs_json for incident questions
+- If tool returns error key → report it, do not guess
 - Never show raw JSON or stack traces."""
 
     return create_react_agent(model, [
         get_all_deployments_json, get_all_pod_resources_json,
         get_pod_logs_json, list_datasources,
     ], prompt=system_prompt)
-
 
 async def chat(user_input: str, model, history: List[Dict] = None) -> str:
     print(f"User: {user_input}")
@@ -164,7 +233,7 @@ async def chat(user_input: str, model, history: List[Dict] = None) -> str:
     messages.append(HumanMessage(content=user_input))
 
     route = classify_route(user_input)
-    print(f"Route: {route}")
+    print(f"Route → {route}")
 
     try:
         if route == "finops":
@@ -194,7 +263,7 @@ if __name__ == "__main__":
         model = await setup()
         history = []
         print("\nChat with CloudOps Agent (type 'exit' to quit)")
-        print("Try: 'What is my cost this month?' / 'Is GCP up?' / 'Show pod CPU usage'\n")
+        print("Try: 'What is my cost this month?' / 'Is GCP up?' / 'What GCP services do we have?'\n")
 
         while True:
             user_input = input("You: ").strip()

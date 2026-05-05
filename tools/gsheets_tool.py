@@ -19,6 +19,8 @@ from langchain.tools import tool
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from dotenv import load_dotenv
+from pathlib import Path
+from typing import Optional
 
 load_dotenv()
 
@@ -131,12 +133,12 @@ def fetch_billing_schema() -> dict:
 @tool
 def query_billing_data(
     question: str,
-    year: int = None,
-    month: int = None,
-    provider: str = None,
-    service: str = None,
-    environment: str = None,
-    group_by: str = None,
+    year: Optional[int] = None,
+    month: Optional[int] = None,
+    provider: Optional[str] = None,
+    service: Optional[str] = None,
+    environment: Optional[str] = None,
+    group_by: Optional[str] = None,
 ) -> dict:
     """
     Query cloud billing data and answer cost questions.
