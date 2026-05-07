@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 from pathlib import Path
 from typing import Optional
 
-load_dotenv()
+load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
@@ -42,11 +42,21 @@ SHEET_SERVICE  = "Service_Summary"
 
 _service_cache = None
 
+def _validate_credentials():
+    """Validate that credentials file exists and is readable."""
+    if not os.path.exists(CREDS_PATH):
+        raise FileNotFoundError(f"Credentials file not found: {CREDS_PATH}")
+    if not os.path.isfile(CREDS_PATH):
+        raise ValueError(f"Credentials path is not a file: {CREDS_PATH}")
+    return True
+
 def _get_sheets_service():
     """Build and cache the Google Sheets API service client."""
     global _service_cache
     if _service_cache:
         return _service_cache
+    
+    _validate_credentials()
     creds = Credentials.from_service_account_file(CREDS_PATH, scopes=SCOPES)
     _service_cache = build("sheets", "v4", credentials=creds)
     return _service_cache
@@ -413,6 +423,76 @@ def detect_cost_anomalies(z_threshold: float = 2.0) -> dict:
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+@tool
+def get_cost_summary() -> dict:
+    """
+    Get a comprehensive cost summary combining current spend, trends, and forecasts.
+    Answers questions about: total cost, cost breakdown, trends, and forecast all at once.
+    Use when user asks: overall cost summary, give me all cost info, complete cost breakdown.
+    """
+    try:
+        df = _load_daily()
+        
+        # Current month cost
+        now = datetime.now()
+        current_df = df[(df["Year"] == now.year) & (df["Month_Num"] == now.month)]
+        if current_df.empty:
+            latest_ym = df["Year_Month"].max()
+            current_df = df[df["Year_Month"] == latest_ym]
+            current_period = f"{latest_ym} (latest)"
+        else:
+            current_period = now.strftime("%Y-%m")
+        
+        current_cost = round(current_df["Daily_Cost_USD"].sum(), 2)
+        
+        # Year-to-date
+        ytd_df = df[df["Year"] == now.year]
+        ytd_cost = round(ytd_df["Daily_Cost_USD"].sum(), 2)
+        
+        # Top services
+        top_services = (
+            df.groupby("Service")["Daily_Cost_USD"]
+            .sum()
+            .nlargest(5)
+            .round(2)
+            .to_dict()
+        )
+        
+        # Provider breakdown
+        by_provider = (
+            df.groupby("Cloud_Provider")["Daily_Cost_USD"]
+            .sum()
+            .round(2)
+            .to_dict()
+        )
+        
+        # Recent trend (last 3 months)
+        monthly = (
+            df.groupby("Year_Month")["Daily_Cost_USD"]
+            .sum()
+            .reset_index()
+            .sort_values("Year_Month")
+            .tail(3)
+        )
+        trend_data = monthly.to_dict(orient="records")
+        
+        return {
+            "current_period": current_period,
+            "current_cost_usd": current_cost,
+            "ytd_cost_usd": ytd_cost,
+            "top_services": top_services,
+            "by_provider": by_provider,
+            "recent_trend_months": trend_data,
+            "summary": {
+                "message": f"Current cost ({current_period}): ${current_cost:,.2f}",
+                "ytd": f"YTD total: ${ytd_cost:,.2f}",
+                "top_services": top_services,
+            }
+        }
+    except Exception as e:
+        return {"error": f"Cost summary failed: {str(e)}"}
 
 
 # ─── DEBUG HELPER (run directly to diagnose data issues) ─────────────────────

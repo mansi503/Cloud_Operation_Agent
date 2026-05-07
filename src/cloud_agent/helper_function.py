@@ -16,6 +16,7 @@ NAMESPACE = os.getenv("NAMESPACE")
 # ── Module-level cache ─────────────────────────────────────────────
 _session_cache  = None
 _prom_uid_cache = None
+_prom_uid_timestamp = None
 
 
 def _get_session() -> requests.Session:
@@ -34,16 +35,36 @@ def _get_session() -> requests.Session:
 
 
 def _get_prom_uid() -> str:
-    """Return cached Prometheus datasource UID, fetching once if needed."""
-    global _prom_uid_cache
-    if _prom_uid_cache is None:
+    """Return cached Prometheus datasource UID, fetching once if needed.
+    
+    Validates cache every 5 minutes to handle Prometheus restarts and UID changes.
+    This prevents stale UID cache across Streamlit reruns."""
+    global _prom_uid_cache, _prom_uid_timestamp
+    
+    now = time.time()
+    cache_expiry = 5 * 60  # 5 minutes
+    
+    # Invalidate cache if expired or not set
+    if (_prom_uid_cache is None or 
+        _prom_uid_timestamp is None or 
+        (now - _prom_uid_timestamp) > cache_expiry):
+        
         session     = _get_session()
         datasources = session.get(f"{BASE_URL}/api/datasources").json()
         prom_ds     = next((d for d in datasources if d.get("type") == "prometheus"), None)
         if not prom_ds:
             raise RuntimeError("No Prometheus datasource found in Grafana")
-        _prom_uid_cache = prom_ds["uid"]
-        print(f"[cache] Prometheus UID: {_prom_uid_cache}")
+        
+        new_uid = prom_ds["uid"]
+        
+        # Log if UID changed
+        if _prom_uid_cache and _prom_uid_cache != new_uid:
+            print(f"[cache] Prometheus UID changed from {_prom_uid_cache} to {new_uid}")
+        
+        _prom_uid_cache = new_uid
+        _prom_uid_timestamp = now
+        print(f"[cache] Prometheus UID: {_prom_uid_cache} (refreshed)")
+    
     return _prom_uid_cache
 
 
@@ -51,6 +72,7 @@ def _query_prometheus(queries: list, from_ms: int, to_ms: int) -> dict:
     """
     POST all PromQL queries to Grafana in one request.
     queries: list of dicts with keys: refId, expr, format, instant
+    Returns full response with debug info if queries fail.
     """
     session = _get_session()
     ds_uid  = _get_prom_uid()
@@ -72,9 +94,12 @@ def _query_prometheus(queries: list, from_ms: int, to_ms: int) -> dict:
         "queries": full_queries,
     }
 
+    print(f"[PROM] Querying with payload: {payload}")
     resp = session.post(f"{BASE_URL}/api/ds/query", json=payload)
     resp.raise_for_status()
-    return resp.json()
+    result = resp.json()
+    print(f"[PROM] Response: {result}")
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -389,6 +414,8 @@ def get_all_pod_resources_json(INTERVAL="4h", RESOLUTION="5m", lookback_minutes=
         now_ms  = int(time.time() * 1000)
         from_ms = now_ms - lookback_minutes * 60 * 1000
 
+        print(f"[HEALTH] Querying for service health metrics (lookback: {lookback_minutes}m)")
+
         data = _query_prometheus(
             [
                 {"refId": "uptime", "expr": "gcp_service_uptime_percent",
@@ -400,21 +427,63 @@ def get_all_pod_resources_json(INTERVAL="4h", RESOLUTION="5m", lookback_minutes=
         )
 
         services = {}
+        results = data.get("results", {})
+        
+        # Check if either query returned an error
         for ref_id in ["uptime", "health"]:
-            for frame in data.get("results", {}).get(ref_id, {}).get("frames", []) or []:
-                fields      = frame.get("schema", {}).get("fields", []) or []
-                value_field = next((f for f in fields if f.get("name") == "Value"), None)
-                if not value_field:
+            ref_data = results.get(ref_id, {})
+            if ref_data.get("error"):
+                print(f"[HEALTH] Error in {ref_id} query: {ref_data.get('error')}")
+        
+        for ref_id in ["uptime", "health"]:
+            ref_data = results.get(ref_id, {})
+            frames = ref_data.get("frames", []) or []
+            
+            if not frames:
+                print(f"[HEALTH] No frames returned for {ref_id} query")
+                continue
+            
+            print(f"[HEALTH] Processing {len(frames)} frames for {ref_id}")
+            
+            for frame_idx, frame in enumerate(frames):
+                schema = frame.get("schema", {})
+                fields = schema.get("fields", []) or []
+                
+                # Prometheus response has: fields[0] = Time, fields[1] = metric value
+                # The metric field (index 1) contains the labels and values
+                if len(fields) < 2:
+                    print(f"[HEALTH] Frame {frame_idx}: expected 2 fields, got {len(fields)}")
                     continue
-                labels  = value_field.get("labels") or {}
+                
+                # The metric value field is always at index 1
+                metric_field = fields[1]
+                labels = metric_field.get("labels") or {}
+                
                 service = labels.get("service")
-                region  = labels.get("region", "N/A")
+                region = labels.get("region", "N/A")
+                
                 if not service:
+                    print(f"[HEALTH] Frame {frame_idx}: no service label")
                     continue
-                vals = frame.get("data", {}).get("values", [])
-                if len(vals) < 2 or not vals[1]:
+                
+                # Extract the value from data
+                data_dict = frame.get("data", {})
+                values_arrays = data_dict.get("values", [])
+                
+                # values_arrays is [[timestamp], [metric_value]]
+                # We need the metric value which is at index 1
+                if len(values_arrays) < 2 or not values_arrays[1]:
+                    print(f"[HEALTH] Frame {frame_idx}: no metric value data")
                     continue
-                value = vals[1][0]
+                
+                value_col = values_arrays[1]
+                if not value_col or len(value_col) == 0:
+                    print(f"[HEALTH] Frame {frame_idx}: metric value array is empty")
+                    continue
+                
+                value = value_col[0]
+                print(f"[HEALTH] ✓ {ref_id}/{service}: {value}")
+                
                 if service not in services:
                     services[service] = {
                         "service":      service,
@@ -422,12 +491,25 @@ def get_all_pod_resources_json(INTERVAL="4h", RESOLUTION="5m", lookback_minutes=
                         "uptime":       None,
                         "health_score": None,
                     }
+                
                 if ref_id == "uptime":
-                    services[service]["uptime"] = round(value, 4)
+                    services[service]["uptime"] = round(float(value), 4) if value else None
                 elif ref_id == "health":
-                    services[service]["health_score"] = round(value, 2)
-
+                    services[service]["health_score"] = round(float(value), 2) if value else None
+        
         records = sorted(services.values(), key=lambda r: r["service"])
+        print(f"[HEALTH] Successfully parsed {len(records)} services with health data")
+        
+        if not records:
+            print("[HEALTH] WARNING: No health data found. Check Prometheus response structure.")
+            return {
+                "error": "No health data available. Prometheus returned frames but could not parse values. Run 'get_available_metrics' to diagnose.",
+                "context": {
+                    "namespace": "GCP",
+                    "lookback_minutes": lookback_minutes,
+                }
+            }
+        
         return {
             "context": {
                 "namespace":        "GCP",
@@ -436,7 +518,13 @@ def get_all_pod_resources_json(INTERVAL="4h", RESOLUTION="5m", lookback_minutes=
             "pods": records,
         }
     except Exception as e:
-        return {"error": str(e)}
+        print(f"[HEALTH] Exception in get_all_pod_resources_json: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "error": f"Failed to fetch health metrics: {str(e)}. Check Prometheus connectivity and metric availability.",
+            "context": {"namespace": "GCP"},
+        }
 
 
 @tool
@@ -456,6 +544,8 @@ def get_pod_logs_json(
         now_ms  = int(time.time() * 1000)
         from_ms = now_ms - lookback_hours * 60 * 60 * 1000
 
+        print(f"[INCIDENTS] Querying for incidents (lookback: {lookback_hours}h)")
+
         data = _query_prometheus(
             [
                 {"refId": "incidents", "expr": "gcp_incident_active",
@@ -467,15 +557,41 @@ def get_pod_logs_json(
         )
 
         incidents = {}
+        results = data.get("results", {})
+
+        # Check for errors in either query
+        for ref_id in ["incidents", "duration"]:
+            ref_data = results.get(ref_id, {})
+            if ref_data.get("error"):
+                print(f"[INCIDENTS] Error in {ref_id} query: {ref_data.get('error')}")
 
         # Parse active status
-        for frame in data.get("results", {}).get("incidents", {}).get("frames", []) or []:
-            fields      = frame.get("schema", {}).get("fields", []) or []
-            value_field = next((f for f in fields if f.get("name") == "Value"), None)
-            if not value_field:
+        incidents_frames = results.get("incidents", {}).get("frames", []) or []
+        print(f"[INCIDENTS] Got {len(incidents_frames)} frames for incidents")
+        
+        for frame_idx, frame in enumerate(incidents_frames):
+            fields = frame.get("schema", {}).get("fields", []) or []
+            
+            # Prometheus response: fields[0] = Time, fields[1] = metric with labels
+            if len(fields) < 2:
+                print(f"[INCIDENTS] Frame {frame_idx}: expected 2 fields, got {len(fields)}")
                 continue
-            labels = value_field.get("labels") or {}
+            
+            # The metric field contains labels and value
+            metric_field = fields[1]
+            labels = metric_field.get("labels") or {}
             inc_id = labels.get("id")
+            
+            # Get the metric value to determine if active (1) or not (0)
+            data_dict = frame.get("data", {})
+            values_arrays = data_dict.get("values", [])
+            
+            if len(values_arrays) < 2 or not values_arrays[1]:
+                print(f"[INCIDENTS] Frame {frame_idx}: no incident value data")
+                continue
+            
+            incident_value = values_arrays[1][0] if values_arrays[1] else 0
+            
             if inc_id:
                 incidents[inc_id] = {
                     "id":       inc_id,
@@ -484,19 +600,30 @@ def get_pod_logs_json(
                     "status":   labels.get("status"),
                     "region":   labels.get("region"),
                     "duration": None,
+                    "active_value": incident_value,
                 }
+                print(f"[INCIDENTS] Found incident: {inc_id} (active={incident_value})")
 
         # Parse duration
-        for frame in data.get("results", {}).get("duration", {}).get("frames", []) or []:
-            fields      = frame.get("schema", {}).get("fields", []) or []
-            value_field = next((f for f in fields if f.get("name") == "Value"), None)
-            if not value_field:
+        duration_frames = results.get("duration", {}).get("frames", []) or []
+        print(f"[INCIDENTS] Got {len(duration_frames)} frames for duration")
+        
+        for frame in duration_frames:
+            fields = frame.get("schema", {}).get("fields", []) or []
+            
+            if len(fields) < 2:
                 continue
-            labels = value_field.get("labels") or {}
+            
+            metric_field = fields[1]
+            labels = metric_field.get("labels") or {}
             inc_id = labels.get("id")
-            vals   = frame.get("data", {}).get("values", [])
-            if inc_id and inc_id in incidents and len(vals) >= 2 and vals[1]:
-                incidents[inc_id]["duration"] = vals[1][0]
+            
+            data_dict = frame.get("data", {})
+            values_arrays = data_dict.get("values", [])
+            
+            if inc_id and inc_id in incidents and len(values_arrays) >= 2 and values_arrays[1]:
+                incidents[inc_id]["duration"] = values_arrays[1][0]
+                print(f"[INCIDENTS] Set duration for {inc_id}: {incidents[inc_id]['duration']}")
 
         now  = datetime.now(tz=timezone.utc)
         logs = []
@@ -520,6 +647,20 @@ def get_pod_logs_json(
         sev_order = {"high": 0, "medium": 1, "low": 2}
         logs.sort(key=lambda x: sev_order.get(x.get("severity", "low"), 3))
 
+        print(f"[INCIDENTS] Found {len(logs)} incidents")
+        
+        if not logs:
+            print("[INCIDENTS] No incidents found. This is good! The system is healthy.")
+            return {
+                "context": {
+                    "namespace": "GCP",
+                    "from":      f"now-{lookback_hours}h",
+                    "to":        "now",
+                },
+                "logs": [],
+                "note": "No active incidents found. ✅ All services are operating normally.",
+            }
+
         return {
             "context": {
                 "namespace": "GCP",
@@ -529,7 +670,13 @@ def get_pod_logs_json(
             "logs": logs,
         }
     except Exception as e:
-        return {"error": str(e)}
+        print(f"[INCIDENTS] Exception: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "error": f"Failed to fetch incident data: {str(e)}. Check Prometheus connectivity.",
+            "context": {"namespace": "GCP"},
+        }
 
 
 @tool
@@ -540,6 +687,144 @@ def list_datasources():
         return _get_session().get(f"{BASE_URL}/api/datasources").json()
     except Exception as e:
         return {"error": str(e)}
+
+
+@tool
+def get_available_metrics() -> dict:
+    """
+    Retrieve all available metrics from Prometheus and check mock exporter connectivity.
+    Use this to diagnose what metrics exist, their naming, and debug connectivity issues.
+    Returns: available GCP metrics, datasource info, and direct exporter metrics.
+    """
+    try:
+        session = _get_session()
+        
+        metrics_info = {
+            "grafana_url": BASE_URL,
+            "datasource_uid": _get_prom_uid(),
+            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+        }
+        
+        # 1. Try to get metric names via Prometheus labels endpoint
+        try:
+            ds_uid = _get_prom_uid()
+            label_resp = session.get(f"{BASE_URL}/api/datasources/proxy/{ds_uid}/api/v1/label/__name__/values")
+            if label_resp.status_code == 200:
+                all_metrics = label_resp.json().get("data", [])
+                gcp_metrics = [m for m in all_metrics if "gcp" in m.lower()]
+                metrics_info["prometheus_metrics"] = {
+                    "gcp_metrics": gcp_metrics,
+                    "total_metrics": len(all_metrics),
+                }
+                print(f"[METRICS] Found {len(gcp_metrics)} GCP metrics in Prometheus")
+        except Exception as e:
+            print(f"[METRICS] Could not query Prometheus labels: {str(e)}")
+            metrics_info["prometheus_error"] = str(e)
+        
+        # 2. Try to connect directly to mock exporter
+        try:
+            exporter_url = "http://localhost:8000/metrics"
+            exporter_resp = requests.get(exporter_url, timeout=5)
+            if exporter_resp.status_code == 200:
+                metrics_text = exporter_resp.text
+                gcp_metrics_in_exporter = [line for line in metrics_text.split('\n') 
+                                          if line.startswith('gcp_') and not line.startswith('#')]
+                metrics_info["mock_exporter"] = {
+                    "status": "connected",
+                    "url": exporter_url,
+                    "metrics_count": len(gcp_metrics_in_exporter),
+                    "sample_metrics": gcp_metrics_in_exporter[:5],
+                }
+                print(f"[METRICS] Mock exporter is running with {len(gcp_metrics_in_exporter)} metrics")
+            else:
+                metrics_info["mock_exporter"] = {"status": "error", "http_code": exporter_resp.status_code}
+        except Exception as e:
+            metrics_info["mock_exporter"] = {"status": "unreachable", "error": str(e)}
+            print(f"[METRICS] Mock exporter unreachable: {str(e)}")
+        
+        return metrics_info
+    except Exception as e:
+        return {
+            "error": f"Could not retrieve metrics: {str(e)}", 
+            "grafana_url": BASE_URL,
+            "suggestion": "Check if Grafana is running and Prometheus is configured as a datasource",
+        }
+
+
+
+@tool
+def get_health_summary() -> dict:
+    """
+    Get a comprehensive health summary combining service health and incidents.
+    Answers questions about: overall system health, which services are affected, and incident severity.
+    Use when user asks: what is the health of our services, are there any problems, system status.
+    """
+    try:
+        print("[SUMMARY] Starting comprehensive health check...")
+        
+        # Get services and health metrics
+        services_result = get_all_deployments_json.invoke({})
+        health_result = get_all_pod_resources_json.invoke({})
+        incidents_result = get_pod_logs_json.invoke({})
+        
+        # Check for errors
+        if "error" in services_result:
+            print(f"[SUMMARY] Services error: {services_result.get('error')}")
+            return {"error": f"Cannot fetch services: {services_result.get('error')}"}
+        
+        # Build summary
+        summary = {
+            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+            "services_count": services_result.get("count", 0),
+            "services_monitored": services_result.get("deployments", []),
+        }
+        
+        # Add health metrics if available
+        if "error" not in health_result:
+            pods = health_result.get("pods", [])
+            if pods:
+                healthy_count = sum(1 for p in pods if p.get("uptime", 0) >= 99.0)
+                degraded_count = sum(1 for p in pods if 95.0 <= p.get("uptime", 0) < 99.0)
+                critical_count = sum(1 for p in pods if p.get("uptime", 0) < 95.0)
+                
+                summary.update({
+                    "health_metrics": {
+                        "healthy": healthy_count,
+                        "degraded": degraded_count,
+                        "critical": critical_count,
+                        "total": len(pods),
+                    },
+                    "services_health": pods,
+                })
+                print(f"[SUMMARY] Health: {healthy_count} healthy, {degraded_count} degraded, {critical_count} critical")
+            else:
+                print("[SUMMARY] No pod data in health result")
+                summary["health_metrics"] = {"status": "no_data"}
+        else:
+            print(f"[SUMMARY] Health error: {health_result.get('error')}")
+            summary["health_error"] = health_result.get("error")
+        
+        # Add incidents if available
+        if "error" not in incidents_result:
+            incidents = incidents_result.get("logs", [])
+            active_incidents = [i for i in incidents if i.get("status") == "active"]
+            summary["active_incidents"] = {
+                "count": len(active_incidents),
+                "incidents": active_incidents,
+            }
+            print(f"[SUMMARY] Incidents: {len(active_incidents)} active")
+        else:
+            print(f"[SUMMARY] Incidents error: {incidents_result.get('error')}")
+            summary["incidents_error"] = incidents_result.get("error")
+        
+        print("[SUMMARY] Health summary complete")
+        return summary
+    except Exception as e:
+        print(f"[SUMMARY] Exception: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {"error": f"Health summary failed: {str(e)}"}
+
 
 
 # ══════════════════════════════════════════════════════════════════

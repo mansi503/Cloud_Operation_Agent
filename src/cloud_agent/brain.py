@@ -15,6 +15,7 @@ from tools.gsheets_tool import (
     get_max_min_cost_period,
     get_cost_forecast,
     detect_cost_anomalies,
+    get_cost_summary,
 )
 
 from pathlib import Path
@@ -91,34 +92,40 @@ def _build_finops_agent(model):
 DATA SOURCE: Google Sheets billing dataset (GCP, AWS, Azure costs Jan 2023 to Apr 2026).
 
 TOOL SELECTION — follow this strictly:
-1. "this month" / "current month" / "how much this month"  → get_current_month_cost (no parameters)
-2. "trend" / "over time" / "monthly comparison"            → get_cost_trend
-3. "highest" / "lowest" / "most expensive month"           → get_max_min_cost_period
-4. "forecast" / "predict" / "future cost"                  → get_cost_forecast
-5. "anomaly" / "spike" / "unusual" / "unexpected"          → detect_cost_anomalies
-6. "what data" / "schema" / "what services exist"          → fetch_billing_schema
-7. Specific year / provider / service / breakdown          → query_billing_data
+1. "overall" / "summary" / "give me all cost info"              → get_cost_summary (comprehensive)
+2. "this month" / "current month" / "how much this month"      → get_current_month_cost (no parameters)
+3. "trend" / "over time" / "monthly comparison"                → get_cost_trend
+4. "highest" / "lowest" / "most expensive month"               → get_max_min_cost_period
+5. "forecast" / "predict" / "future cost"                      → get_cost_forecast
+6. "anomaly" / "spike" / "unusual" / "unexpected"              → detect_cost_anomalies
+7. "what data" / "schema" / "what services exist"              → fetch_billing_schema
+8. Specific year / provider / service / breakdown              → query_billing_data
 
-RESPONSE FORMAT — always structure answers like this:
+RESPONSE FORMAT — ALWAYS structure answers EXACTLY like this:
 **Summary**
-One sentence answer with the key number.
+One sentence answer with the key number. Use USD format: 12,345.67 (NO dollar signs).
 
 **Breakdown**
-- Item 1: value
-- Item 2: value
+- Item 1: value (USD format)
+- Item 2: value (USD format)
+(If no breakdown available, write: "No breakdown available")
 
 **Insight**
 One sentence of useful context or trend observation.
 
-RULES:
-- Never call query_billing_data for current month — use get_current_month_cost
-- Only report data from tools. Never fabricate numbers.
-- Always use USD with commas e.g. 12,345.67 (do NOT use dollar signs)
-- Never show raw JSON or stack traces."""
+CRITICAL RULES:
+1. Never call query_billing_data for current month — use get_current_month_cost ONLY
+2. If tool returns error key → report clearly: "Unable to fetch data. Error: [message]"
+3. Always format costs as: 12,345.67 (comma separators, 2 decimals, NO dollar signs)
+4. Never fabricate numbers — only report tool data
+5. Never show raw JSON, stack traces, or technical errors
+6. If data is empty or None, report: "No data available for this period"
+7. When formatting numbers: use commas for thousands (1,000 not 1000)"""
 
     return create_react_agent(model, [
         fetch_billing_schema, query_billing_data, get_current_month_cost,
-        get_cost_trend, get_max_min_cost_period, get_cost_forecast, detect_cost_anomalies,
+        get_cost_trend, get_max_min_cost_period, get_cost_forecast, 
+        detect_cost_anomalies, get_cost_summary,
     ], prompt=system_prompt)
 
 
@@ -163,7 +170,7 @@ RULES:
 def _build_health_agent(model):
     from src.cloud_agent.helper_function import (
         get_all_deployments_json, get_all_pod_resources_json,
-        get_pod_logs_json, list_datasources,
+        get_pod_logs_json, list_datasources, get_health_summary, get_available_metrics,
     )
     from datetime import datetime
     today = datetime.now().strftime("%B %d, %Y")
@@ -171,9 +178,26 @@ def _build_health_agent(model):
 
 DATA SOURCE: Prometheus metrics via Grafana API (local setup).
 
-IMPORTANT: If a tool returns an "error" key, report it clearly to the user as:
-"I was unable to fetch [data type]. Error: [error message]"
-Never fall back to generic knowledge when a tool returns an error.
+TOOL SELECTION — follow this strictly:
+1. "overall" / "summary" / "complete health"               → get_health_summary (comprehensive)
+2. "services" / "list" / "what services"                   → get_all_deployments_json
+3. "health" / "uptime" / "health scores"                   → get_all_pod_resources_json
+4. "incidents" / "problems" / "down"                       → get_pod_logs_json
+5. "datasources" / "connected data"                        → list_datasources
+6. "what metrics" / "available metrics" / "diagnose"       → get_available_metrics (for debugging)
+
+CRITICAL ERROR HANDLING:
+If a tool returns an error or no data → ALWAYS do this:
+1. Report the error clearly: "I was unable to fetch [data type]. Error: [message]"
+2. Suggest diagnostic step: "Let me check what metrics are available..."
+3. Call get_available_metrics to diagnose the issue
+4. THEN report findings: "The issue is: [root cause from diagnostics]"
+5. Never fall back to generic knowledge when a tool fails
+
+KEY DIAGNOSTIC STEPS:
+- If health metrics fail → use get_available_metrics to check if metrics exist
+- If Prometheus UID is wrong → it will be caught automatically (5-minute cache refresh)
+- If mock exporter not running → get_available_metrics will show it's unreachable
 
 AVAILABLE METRICS:
 - gcp_service_uptime_percent    — uptime % per service
@@ -184,38 +208,48 @@ AVAILABLE METRICS:
 SERVICES: compute_engine, cloud_storage, bigquery, cloud_run, cloud_sql,
           kubernetes_engine, cloud_functions
 
-TOOL MAPPING:
-- List GCP services              → get_all_deployments_json
-- Uptime % and health scores     → get_all_pod_resources_json
-- Active incidents               → get_pod_logs_json
-- List Grafana datasources       → list_datasources
+RESPONSE FORMAT — ALWAYS structure answers EXACTLY like this:
 
-RESPONSE FORMAT:
+For Service Health Questions:
 **Service Health Overview**
-| Service | Uptime | Health Score | Status |
-|---------|--------|--------------|--------|
-| ...     | ...    | ...          | ...    |
+| Service | Uptime % | Health Score | Status |
+|---------|----------|--------------|--------|
+| compute_engine | 99.95% | 98.5 | Healthy |
+| ... | ... | ... | ... |
 
 **Active Incidents**
-List any active incidents with severity and duration.
+[List any active incidents with severity and duration, or: "No active incidents"]
 
 **Summary**
-One line overall assessment.
+One line overall assessment based on the data.
 
-HEALTH CLASSIFICATION:
+For Incident Questions:
+**Active Incidents**
+- [Service]: [Severity] | [Duration] | [Status] | [Region]
+(Or: "No active incidents found")
+
+**Summary**
+Overall incident status in one line.
+
+HEALTH CLASSIFICATION — ALWAYS use these:
 - Healthy  = uptime >= 99.0%
 - Degraded = uptime 95.0% to 98.99%
 - Critical = uptime < 95.0%
 
-RULES:
-- Call get_all_pod_resources_json for health/uptime questions
-- Call get_pod_logs_json for incident questions
-- If tool returns error key → report it, do not guess
-- Never show raw JSON or stack traces."""
+CRITICAL RULES:
+1. If tool returns error → report it. Do NOT guess or make up data.
+2. Call get_health_summary for overall health questions first
+3. Call get_all_pod_resources_json for specific health/uptime questions
+4. Call get_pod_logs_json for incident questions  
+5. Format percentages: 99.95% (2 decimals, always include %)
+6. Format health scores: 98.5 (out of 100, 1 decimal)
+7. Never show raw JSON or stack traces
+8. If data is empty/None → report: "No health data available"
+9. Always validate that tool data exists before displaying"""
 
     return create_react_agent(model, [
         get_all_deployments_json, get_all_pod_resources_json,
-        get_pod_logs_json, list_datasources,
+        get_pod_logs_json, list_datasources, get_health_summary, get_available_metrics,
     ], prompt=system_prompt)
 
 async def chat(user_input: str, model, history: List[Dict] = None) -> str:
