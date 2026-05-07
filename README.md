@@ -332,6 +332,3 @@ For issues or questions:
 
 ---
 
-**Last Updated**: May 3, 2026  
-**Status**: Proof of Concept (POC)  
-**Scope**: MyDNVSoftware data only
