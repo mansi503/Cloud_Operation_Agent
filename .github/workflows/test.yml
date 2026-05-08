@@ -56,10 +56,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Install Bandit
+        run: pip install bandit
+
       - name: Run Bandit security check
-        uses: gaurav-nelson/github-action-bandit@v1
-        with:
-          path: "src"
+        run: bandit -r src/
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
