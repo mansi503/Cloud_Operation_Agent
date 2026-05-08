@@ -7,7 +7,7 @@ services:
       context: .
       dockerfile: Dockerfile.exporter
     ports:
-      - "8000:8000"
+      - "8001:8000"
     environment:
       - LOG_LEVEL=INFO
     networks:

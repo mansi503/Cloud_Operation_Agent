@@ -76,8 +76,6 @@ docs/
 Jenkinsfile
 
 # Development
-docker-compose.yml
-Dockerfile.exporter
 start_all.bat
 start_all.sh
 setup.bat

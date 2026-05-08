@@ -1,6 +1,6 @@
 # GCP Mock Exporter - Lightweight Python HTTP server for Prometheus metrics
 
-FROM python:3.11-slim
+FROM python:3.11-bookworm
 
 WORKDIR /app
 
